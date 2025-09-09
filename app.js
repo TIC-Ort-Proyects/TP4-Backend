@@ -33,6 +33,34 @@ app.post('/signup', async (req, res) => {
     }
 })
 
+app.get('/listens', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if(!authHeader || !authHeader.startsWith('Bearer ')){
+        return res.status(401).json({ success:false, message:'Falta header Authorization Bearer' });
+    }
+    let payload;
+    try {
+        const token = authHeader.split(' ')[1];
+        payload = jwt.verify(token, process.env.JWT_SECRET); // { userId, username, iat, exp }
+    } catch (err) {
+        return res.status(401).json({ success:false, message:'Token inválido o expirado' });
+    }
+
+    const client = new Client(config);
+    await client.connect();
+
+    const userId = payload.userId;
+    try {
+        const result = await client.query('SELECT * FROM songlisten WHERE user_id = $1 ORDER BY listened_at DESC', [userId]);
+        res.status(200).json({ success: true, listens: result.rows });
+    } catch (error) {
+        console.error('Error fetching listens:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    } finally {
+        await client.end();
+    }
+})
+
 app.post('/signin', async (req, res) => {
     const client = new Client(config);
     await client.connect();
