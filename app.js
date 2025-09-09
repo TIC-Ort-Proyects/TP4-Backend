@@ -33,7 +33,8 @@ app.post('/signup', async (req, res) => {
     }
 })
 
-app.get('/listens', async (req, res) => {
+app.get('/listen', async (req, res) => {
+    // Autenticación por token (igual estilo que otras rutas)
     const authHeader = req.headers.authorization;
     if(!authHeader || !authHeader.startsWith('Bearer ')){
         return res.status(401).json({ success:false, message:'Falta header Authorization Bearer' });
@@ -50,12 +51,27 @@ app.get('/listens', async (req, res) => {
     await client.connect();
 
     const userId = payload.userId;
+    const sql = `
+        SELECT
+            s.id AS song_id,
+            s.name AS song_name,
+            COUNT(sl.id)::int AS times_listened,
+            MAX(sl.listened_at) AS last_listened_at
+        FROM songlisten sl
+        INNER JOIN song s ON s.id = sl.song_id
+        WHERE sl.user_id = $1
+        GROUP BY s.id, s.name
+        ORDER BY times_listened DESC, last_listened_at DESC;
+    `;
     try {
-        const result = await client.query('SELECT * FROM songlisten WHERE user_id = $1 ORDER BY listened_at DESC', [userId]);
-        res.status(200).json({ success: true, listens: result.rows });
+        const result = await client.query(sql, [userId]);
+        res.status(200).json({
+            success: true,
+            songs: result.rows
+        });
     } catch (error) {
-        console.error('Error fetching listens:', error);
-        res.status(500).json({ success: false, message: 'Internal Server Error' });
+        console.error('Error obteniendo listens agregados:', error);
+        res.status(500).json({ success:false, message:'Internal Server Error' });
     } finally {
         await client.end();
     }
