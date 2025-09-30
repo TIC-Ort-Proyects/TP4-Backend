@@ -3,6 +3,7 @@ import express from "express";
 import 'dotenv/config'
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
+import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
 
 import pkg from 'pg'
@@ -12,45 +13,104 @@ const app = express()
 const PORT = 8000
 
 app.use(express.json());
+app.use(cookieParser());
 
-app.post('/signup', async (req, res) => {
+async function authMiddleware(requiredRole = null) {
+    return async (req, res, next) => {
+        try {
+            let token;
+            const authHeader = req.headers.authorization;
+            if (authHeader && authHeader.startsWith('Bearer ')) {
+                token = authHeader.split(' ')[1];
+            } else if (req.cookies && req.cookies.session_token) {
+                token = req.cookies.session_token;
+            }
+            if (!token) {
+                return res.status(401).json({ success: false, message: 'Falta token JWT' });
+            }
+    
+            const payload = jwt.verify(token, process.env.JWT_SECRET);
+
+            if (requiredRole && payload.role !== requiredRole) {
+                return res.status(403).json({ success: false, message: 'No autorizado: rol insuficiente' });
+            }
+            req.user = payload;
+            next();
+        } catch (err) {
+            return res.status(401).json({ success: false, message: 'Token inválido o expirado' });
+        }
+    }
+}
+
+app.post('/signup', async (req, res, next) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: 'username y password son requeridos' });
+    }
+    const client = new Client(config);
+    await client.connect();
+
+    const userId = crypto.randomUUID();
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const token = jwt.sign({ userId, username, role: "user" }, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+    try {
+        await client.query(
+            'INSERT INTO users (id, username, password, role) VALUES ($1, $2, $3, $4) RETURNING *',
+            [userId, username, hashedPassword, "user"]
+        );
+        res
+        .cookie('session_token', token, { httpOnly: true, sameSite: 'lax', maxAge: 3600000 })
+        .status(201)
+        .json({ success: true, message: "Register successful", token });
+    } catch (error) {
+        if (error.code === '23505') { // unique_violation
+            res.status(409).json({ success: false, message: 'El usuario ya existe' });
+        } else {
+            next(error);
+        }
+    } finally {
+        await client.end();
+    }
+})
+
+app.post('/signin', async (req, res) => {
     const client = new Client(config);
     await client.connect();
 
     const { username, password } = req.body;
-    const userId = crypto.randomUUID();
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const token = jwt.sign({ userId, username }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
     try {
-        const result = await client.query('INSERT INTO users (id, username, password) VALUES ($1, $2, $3) RETURNING *', [userId, username, hashedPassword]);
-        res.status(201).json({ success: true, message: "Register successful", token });
+        const result = await client.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
+
+        if (user && await bcrypt.compare(password, user.password)) {
+            const token = jwt.sign(
+                { userId: user.id, username: user.username, role: user.role },
+                process.env.JWT_SECRET,
+                { expiresIn: '1h' }
+            );
+            res
+            .cookie('session_token', token, { httpOnly: true, sameSite: 'lax', maxAge: 3600000 })
+            .status(200)
+            .json({ success: true, message: 'Login successful', token });
+        } else {
+            res.status(401).json({ success: false, message: 'Invalid credentials' });
+        }
     } catch (error) {
-        console.error('Error inserting user:', error);
+        console.error('Error during login:', error);
         res.status(500).json({ success: false, message: 'Internal Server Error' });
     } finally {
         await client.end();
     }
 })
 
-app.get('/listen', async (req, res) => {
-    // Autenticación por token (igual estilo que otras rutas)
-    const authHeader = req.headers.authorization;
-    if(!authHeader || !authHeader.startsWith('Bearer ')){
-        return res.status(401).json({ success:false, message:'Falta header Authorization Bearer' });
-    }
-    let payload;
-    try {
-        const token = authHeader.split(' ')[1];
-        payload = jwt.verify(token, process.env.JWT_SECRET); // { userId, username, iat, exp }
-    } catch (err) {
-        return res.status(401).json({ success:false, message:'Token inválido o expirado' });
-    }
-
+// --- Protegidas con middleware ---
+app.get('/listen', await authMiddleware(), async (req, res) => {
     const client = new Client(config);
     await client.connect();
 
-    const userId = payload.userId;
+    const userId = req.user.userId;
     const sql = `
         SELECT
             s.id AS song_id,
@@ -77,44 +137,7 @@ app.get('/listen', async (req, res) => {
     }
 })
 
-app.post('/signin', async (req, res) => {
-    const client = new Client(config);
-    await client.connect();
-
-    const { username, password } = req.body;
-
-    try {
-        const result = await client.query('SELECT * FROM users WHERE username = $1', [username]);
-        const user = result.rows[0];
-
-        if (user && await bcrypt.compare(password, user.password)) {
-            const token = jwt.sign({ userId: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '1h' });
-            res.status(200).json({ success: true, message: 'Login successful', token });
-        } else {
-            res.status(401).json({ success: false, message: 'Invalid credentials' });
-        }
-    } catch (error) {
-        console.error('Error during login:', error);
-        res.status(500).json({ success: false, message: 'Internal Server Error' });
-    } finally {
-        await client.end();
-    }
-})
-
-app.post('/listen', async (req, res) => {
-    // Extraer y validar token (sin middleware global)
-    const authHeader = req.headers.authorization;
-    if(!authHeader || !authHeader.startsWith('Bearer ')){
-        return res.status(401).json({ success:false, message:'Falta header Authorization Bearer' });
-    }
-    let payload;
-    try {
-        const token = authHeader.split(' ')[1];
-        payload = jwt.verify(token, process.env.JWT_SECRET); // { userId, username, iat, exp }
-    } catch (err) {
-        return res.status(401).json({ success:false, message:'Token inválido o expirado' });
-    }
-
+app.post('/listen', await authMiddleware(), async (req, res) => {
     const client = new Client(config);
     await client.connect();
 
@@ -124,7 +147,7 @@ app.post('/listen', async (req, res) => {
         return res.status(400).json({success:false, message:'songId requerido'});
     }
 
-    const userId = payload.userId;
+    const userId = req.user.userId;
     const listenId = crypto.randomUUID();
     const listenedAt = new Date();
 
@@ -142,16 +165,19 @@ app.post('/listen', async (req, res) => {
     }
 })
 
-app.post('/seed', async (req, res) => {
+app.get('/songs', await authMiddleware(), async (req, res) => {
     const client = new Client(config);
     await client.connect();
+    let result = await client.query("select * from public.song");
+    await client.end();
+    console.log(result.rows);
+    res.send(result.rows);
+})
 
-    const passwordPlain = 'password123';
-    const userId = crypto.randomUUID();
-    const song1Id = crypto.randomUUID();
-    const song2Id = crypto.randomUUID();
-    const listen1Id = crypto.randomUUID();
-    const hashedPassword = await bcrypt.hash(passwordPlain, 10);
+// --- Solo admin puede hacer seed ---
+app.post('/seed', await authMiddleware('admin'), async (req, res) => {
+    const client = new Client(config);
+    await client.connect();
 
     // Dropeamos versiones previas incompatibles
     const statements = [
@@ -162,6 +188,7 @@ app.post('/seed', async (req, res) => {
             id UUID PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
             created_at TIMESTAMPTZ DEFAULT NOW()
         );`,
         `CREATE TABLE song (
@@ -208,15 +235,11 @@ app.get('/about', (_, res) => {
     res.send('About route 🎉 ')
 })
 
-app.get('/songs', async (req, res) => {
-    const client = new Client(config);
-    await client.connect();
-    let result = await client.query("select * from public.song");
-    await client.end();
-    console.log(result.rows);
-    res.send(result.rows);
-
-})
+// Middleware global de manejo de errores
+app.use((err, req, res, next) => {
+    console.error('Error:', err);
+    res.status(500).json({ success: false, message: 'Error interno del servidor' });
+});
 
 app.listen(PORT, () => {
     console.log(`✅ Server is running on port ${PORT}`);
