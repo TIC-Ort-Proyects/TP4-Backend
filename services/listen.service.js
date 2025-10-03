@@ -2,11 +2,10 @@ import { Client } from 'pg'
 import { config } from '../dbconfig.js'
 import crypto from 'crypto'
 
-export async function getListens(req, res) {
+export async function getListens(userId) {
     const client = new Client(config);
     await client.connect();
 
-    const userId = req.user.userId;
     const sql = `
         SELECT
             s.id AS song_id,
@@ -21,39 +20,25 @@ export async function getListens(req, res) {
     `;
     try {
         const result = await client.query(sql, [userId]);
-        res.status(200).json({
-            success: true,
-            songs: result.rows
-        });
-    } catch {
-        res.status(500).json({ success:false, message:'Internal Server Error' });
+        return result.rows;
     } finally {
         await client.end();
     }
 }
 
-export async function addListen(req, res) {
+export async function addListen({ songId, userId }) {
     const client = new Client(config);
     await client.connect();
 
-    const { id } = req.body;
-    if(!id){
-        await client.end();
-        return res.status(400).json({success:false, message:'id requerido'});
-    }
-
-    const userId = req.user.userId;
     const listenId = crypto.randomUUID();
     const listenedAt = new Date();
 
     try {
         const result = await client.query(
             'INSERT INTO songlisten (id, song_id, user_id, listened_at) VALUES ($1, $2, $3, $4) RETURNING *',
-            [listenId, id, userId, listenedAt]
+            [listenId, songId, userId, listenedAt]
         );
-        res.status(201).json({ success: true, message: "Listen recorded", listen: result.rows[0] });
-    } catch {
-        res.status(500).json({ success: false, message: 'Internal Server Error' });
+        return result.rows[0];
     } finally {
         await client.end();
     }
